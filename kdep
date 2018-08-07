@@ -1,0 +1,196 @@
+#!/bin/bash
+set -euo pipefail
+VERSION="1"
+# when debugging, uncomment to see every command (including cleartext secrets) printed in detail:
+#set -x
+
+
+# parse arguments
+USAGE="  Usage:
+    kdep [-d] [-v] [-i] [-t temp-name] [-n namespace] path/to/values-<ns>.yaml
+
+  Flags:
+    -d            Debug. Skips install/upgrade. Adds '--dry-run --debug' to helm upgrade command 
+    -v            Output values. Skips install/upgrade. This option makes the script create the secrets in Kubernetes and then output the generated values file that would be passed to helm upgrade.
+    -n namespace  Override the default namespace. The default namespace is the first word of the chart name. When provided, will be added as a prefix to the release name.
+    -i            Ignore if the passed in file doesn't exist, useful mostly for cicd.
+    -t temp-name  Temporary release name. Launch a chart meant to be deleted shortly after, useful for testing. This flag specifies a custom release name. When - is specified, a release name will be generated.
+
+  Details:
+    kdep stands for Kubernetes Deploy.
+    This script parses the given file, creates Kubernetes secrets as neccessary, and installs the chart with the generated values."
+
+
+DEBUG=false
+justValues=false
+nsOverride=""
+releaseNameOverride=""
+ignoreMissingFile=false
+while getopts :dvit:n: OPT; do
+	case "$OPT" in
+		d)		DEBUG=true;;
+		v)		justValues=true;;
+		i)		ignoreMissingFile=true;;
+		t)		releaseNameOverride=$OPTARG;;
+		n)		nsOverride=$OPTARG;;
+		*)	echo >&2 "$USAGE";exit 1;;
+	esac
+done
+shift $(($OPTIND-1))
+if [ -z ${@+x} ]; then echo >&2 "$USAGE";exit 1;fi
+if [ "$#" -ne "1" ]; then echo >&2 "$USAGE";exit 1;fi
+
+pathToValues=$1
+cd $(dirname "$pathToValues")
+fileToParse=$(basename "$pathToValues")
+
+# sanity checks
+if ! $ignoreMissingFile && [ ! -f "$fileToParse" ]; then
+	echo >&2 "Error: The file that the main argument refers to ($fileToParse) was not found." 
+	exit 1
+fi
+
+if [ ! -f "Chart.yaml" ]; then
+	echo >&2 "Error: The directory provided does not seem to be a chart directory."
+	exit 1
+fi
+
+# quick chart error check
+if [ ! "${PWD##*/}" == "$(yq r Chart.yaml name)" ]; then
+	echo >&2 "Error: Chart name does not match directory name."
+	exit 1
+fi
+
+# by default, get the namespace from the chart name
+namespace=$(yq r Chart.yaml name|cut -d- -f1)
+releasePrefix=""
+if [ "$nsOverride" ]; then
+	namespace=$nsOverride
+	releasePrefix="$namespace-"
+fi
+
+releaseName=$(yq r Chart.yaml name)
+if [ "$releaseNameOverride" == "-" ]; then
+	releaseName=$(yq r Chart.yaml name)$(date '+-%m-%d-%y--%H-%M-%S')
+elif [ "$releaseNameOverride" ]; then
+	releaseName=$releaseNameOverride
+fi
+
+# basic setup and some constants
+rm -rf .tmp
+mkdir -p .tmp
+cat > .tmp/ct-secret.conf <<EOF
+vault {
+  renew_token = false
+  retry {
+    attempts = 1
+  }
+}
+template {
+  contents = "{{ with secret \"__placeholder__\" }}{{ .Data.value }}{{ end }}"
+  error_on_missing_key = true
+}
+EOF
+cat > .tmp/ct-file.conf <<EOF
+vault {
+  renew_token = false
+  retry {
+    attempts = 1
+  }
+}
+template {
+  source = "__placeholder__"
+  error_on_missing_key = true
+}
+EOF
+kubeSecretResource='{"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"labels": {"automation": "auto-configured-secret-from-vault"}}}'
+
+
+# sanity checks, don't exit because perhaps some charts won't use secrets but will customize per-env
+missingBinaries="Missing a required binary in PATH."
+command -v yq >/dev/null 2>&1 || { echo >&2 $missingBinaries; }
+command -v jq >/dev/null 2>&1 || { echo >&2 $missingBinaries; }
+command -v vault >/dev/null 2>&1 || { echo >&2 $missingBinaries; }
+command -v consul-template >/dev/null 2>&1 || { echo >&2 $missingBinaries; }
+
+# get values
+kdep-merge-inherited-values $fileToParse | tee .tmp/original.json > .tmp/values.json
+
+# check version
+valuesFileKdepVersion=$(jq -r 'try .kdep.version' .tmp/original.json)
+if [ ! "$valuesFileKdepVersion" == "$VERSION" ]; then echo >&2 "Error: kdep version mismatch: Values file version: $valuesFileKdepVersion. kdep version: $VERSION. Make sure the values file has the right syntax (check readme in declarative-deployment-tools).";exit 1;fi
+
+
+# Set VAULT_ADDR and VAULT_TOKEN
+if [ -z ${VAULT_ADDR+x} ]; then
+	echo >&2 "Notice: Env var VAULT_ADDR not specified"
+else
+	echo >&2 "Notice: Using VAULT_ADDR value from environment ($VAULT_ADDR)"
+fi
+if [ -z ${VAULT_TOKEN+x} ]; then
+	roleID=$({ kubectl -n $namespace get secret vault-role-id -ojson || true; } | jq -r .data.value|kdep-base64decode)
+	secretID=$({ kubectl -n $namespace get secret vault-secret-id -ojson || true; } | jq -r .data.value|kdep-base64decode)
+	if [ ! "$roleID" ] || [ ! "$secretID" ]; then
+		echo >&2 "Warning: Could not fetch vault credentials from namespace $namespace"
+	else
+		# set token, two lines so that error exits script
+		token=$(vault write -field=token auth/approle/login role_id=${roleID} secret_id=${secretID})
+		export VAULT_TOKEN=$token
+	fi
+else
+	echo >&2 "Notice: Using VAULT_TOKEN value from environment"
+fi
+
+
+# create secrets and save their names to values
+jq -r 'try .kdep.secrets|to_entries[].key' .tmp/original.json | while read -r secretName; do
+	vaultPath=$(jq -r '.kdep.secrets["'$secretName'"]' .tmp/original.json)
+	sed "s#__placeholder__#$vaultPath#" .tmp/ct-secret.conf > .tmp/ct.conf
+
+		# these 4 lines generate and create the secret in Kubernetes and are the same between the two loops
+		encodedSecret=$(consul-template -once -dry -config .tmp/ct.conf|tail -n+2|kdep-base64encode)
+		shahash=$(echo -n "$encodedSecret"|kdep-base64decode|kdep-sha256sum)
+		secretResourceName="auto-configured-secret-from-vault-$shahash"
+		echo -n $kubeSecretResource|jq '.metadata.name="'$secretResourceName'"'|jq '.data.value="'$encodedSecret'"'|kubectl apply -f- --namespace="$namespace" >/dev/null
+	
+	jq '.kdep.secrets["'$secretName'"]="'$secretResourceName'"' .tmp/values.json > .tmp/cache; mv .tmp/cache .tmp/values.json
+done
+
+# parse config files and insert secrets into them - first, paths, and then actual secrets. Then create in kube
+jq -r 'try .kdep.files|to_entries[].key' .tmp/original.json | while read -r secretName; do
+	template=$(jq -r '.kdep.files["'$secretName'"].template' .tmp/original.json)
+	cp $template .tmp/$template
+	jq -r 'try .kdep.files["'$secretName'"].secretPaths|to_entries[].key' .tmp/original.json | while read -r replaceID; do
+		vaultPath=$(jq -r '.kdep.files["'$secretName'"].secretPaths["'$replaceID'"]' .tmp/original.json)
+		sed -i_ 's#\${'"$replaceID"'\}#'"$vaultPath"'#g' .tmp/$template
+	done
+	sed "s#__placeholder__#.tmp/$template#" .tmp/ct-file.conf > .tmp/ct.conf
+	
+		# these 4 lines generate and create the secret in Kubernetes and are the same between the two loops
+		encodedSecret=$(consul-template -once -dry -config .tmp/ct.conf|tail -n+2|kdep-base64encode)
+		shahash=$(echo -n "$encodedSecret"|kdep-base64decode|kdep-sha256sum)
+		secretResourceName="auto-configured-secret-from-vault-$shahash"
+		echo -n $kubeSecretResource|jq '.metadata.name="'$secretResourceName'"'|jq '.data.value="'$encodedSecret'"'|kubectl apply -f- --namespace="$namespace" >/dev/null
+	
+	jq '.kdep.files["'$secretName'"]="'$secretResourceName'"' .tmp/values.json > .tmp/cache; mv .tmp/cache .tmp/values.json
+done
+
+# convert back to yaml
+generatedValues=$(yq r .tmp/values.json)
+rm -rf .tmp
+
+if $justValues; then
+	echo -e "$generatedValues"
+	exit 0
+fi
+
+debugFlags=""
+if $DEBUG; then
+	debugFlags="--dry-run --debug"
+else
+	echo "Values generated successfully. Now attempting to install/upgrade in namespace $namespace via Helm:"
+	# sleep to give a chance to CTRL+C if accidentally passed flag
+	sleep 3
+fi
+
+echo -e "$generatedValues"|helm upgrade --install --force --namespace="$namespace" $debugFlags -f- $releasePrefix$releaseName .

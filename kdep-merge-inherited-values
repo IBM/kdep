@@ -1,0 +1,40 @@
+#!/bin/bash
+# This script is used internally to combines the various values yaml files into one
+# Input to this script is one argument: the path to the top-most values file, the most specific one
+# the script breaks up the filename by dashes and fills in values from less specific files if they exist
+# no files, even the original argument have to exist
+set -euo pipefail
+
+pathToValues=$1
+cd $(dirname "$pathToValues")
+topMostValuesFile=$(basename "$pathToValues")
+
+if [ ! -f "Chart.yaml" ]; then
+	echo "Error: The directory provided does not seem to be a chart directory."
+	exit 1
+fi
+
+root=$(echo "$topMostValuesFile"|rev|cut -d- -f1|rev)
+environment=$(echo "$topMostValuesFile"|rev|cut -d- -f2|rev)
+region=$(echo "$topMostValuesFile"|rev|cut -d- -f3|rev)
+custom=$(echo "$topMostValuesFile"|rev|cut -d- -f4-|rev)
+
+values="{}"
+if [ -f "$root" ]; then
+	echo >&2 "Parsed $root"
+	values=$(echo "$values" "$(yq r -j $root)" | jq -s '.[0] * .[1]' - -)
+fi
+if [ -f "$environment-$root" ]; then
+	echo >&2 "Parsed $environment-$root"
+	values=$(echo "$values" "$(yq r -j $environment-$root)" | jq -s '.[0] * .[1]' - -)
+fi
+if [ -f "$region-$environment-$root" ]; then
+	echo >&2 "Parsed $region-$environment-$root"
+	values=$(echo "$values" "$(yq r -j $region-$environment-$root)" | jq -s '.[0] * .[1]' - -)
+fi
+if [ -f "$custom-$region-$environment-$root" ]; then
+	echo >&2 "Parsed $custom-$region-$environment-$root"
+	values=$(echo "$values" "$(yq r -j $custom-$region-$environment-$root)" | jq -s '.[0] * .[1]' - -)
+fi
+
+echo "$values"
