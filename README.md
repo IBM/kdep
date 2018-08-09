@@ -3,7 +3,7 @@ kdep
 
 kdep stands for Kube Deploy and is a thin wrapper around [Helm](https://helm.sh/) that does two things:
   1) Automatically provisions secrets from [Vault](https://www.vaultproject.io/)
-  2) Simplifies deployment configuration for multiple environments
+  2) Simplifies chart configuration for multiple environments
 
 How it works
 ------------
@@ -26,7 +26,7 @@ Key benefits
 
 Installation
 ------------
-Download a [release](https://github.com/IBM/kdep/releases) and unzip into your PATH.  
+Download a [release](https://github.com/IBM/kdep/releases) and unzip it into your PATH.  
 Required dependencies which you may already have:
  - [jq](https://stedolan.github.io/jq/download/)
  - [yq](https://github.com/mikefarah/yq/releases)
