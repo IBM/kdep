@@ -131,7 +131,7 @@ Two authenticate with Vault there are two options. Option one is via the env var
 
 ### Referring to secrets in Vault directly
 This is done in a values file via the `kdep.secrets` key, for example:
-```
+```yaml
 kdep:
   version: 1
   secrets:
@@ -140,7 +140,7 @@ kdep:
     envSecret: /generic/user/roman/myservice/sec3
 ```
 The above defines three secrets and specifies Vault paths for each. During deployment and before passing the values to Helm, kdep will fetch the referenced secrets, create them in the cluster, and turn the above into:
-```
+```yaml
 kdep:
   version: 1
   secrets:
@@ -152,7 +152,7 @@ In other words, the secret paths are replaced by the generated secret names. Thi
 
 There are two main ways for a pod to consume these secrets - by environment variable or by a filesystem mount.  
 Here is an abridged  example of both:
-```
+```yaml
 apiVersion: apps/v1beta2
 kind: Deployment
 metadata: ...
@@ -189,7 +189,7 @@ spec:
 Sometimes, an application requires secrets in a configuration file. One way to accomplish this is to provide each secret to the container and then construct a special configuration file in the container's entrypoint script on startup. Kdep offers an alternative, perhaps simpler, solution. Instead of saving the configuration file template into the container, to be populated by the entrypoint script, save it to the chart folder. It will then be populated by kdep with secrets from Vault, saved as a secret in the cluster, and mounted in a pod as a volume.
 
 Config file templates are specified in a values file via the `kdep.files` key:
-```
+```yaml
 kdep:
   version: 1
   files:
@@ -201,7 +201,7 @@ kdep:
         kafkaBrokers: /generic/user/roman/mysvc/kafkabrokers
 ```
 During deployment and before passing the values to Helm, kdep will run `main.conf.ctmpl` template through `consul-template`, save the output as a secret in the cluster, and turn the above into:
-```
+```yaml
 kdep:
   version: 1
   files:
@@ -234,7 +234,7 @@ kafka_servers = {
 The details of the templating engine can be found here: https://github.com/hashicorp/consul-template#templating-language
 
 Consuming config file secrets from a pod is the same as consuming regular secrets described above, here is an example:
-```
+```yaml
 apiVersion: apps/v1beta2
 kind: Deployment
 metadata:
