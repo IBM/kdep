@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-VERSION="1"
+VERSION="v0.2"
+GrandfatheredInVersion="1" # started out using this version. Keeping for backwards compatibility.
 # when debugging, uncomment to see every command (including cleartext secrets) printed in detail:
 #set -x
 
@@ -136,8 +137,9 @@ kdep-merge-inherited-values $fileToParse | tee .tmp/original.json > .tmp/values.
 
 # check version
 valuesFileKdepVersion=$(jq -r 'try .kdep.version' .tmp/original.json)
-if [ ! "$valuesFileKdepVersion" == "$VERSION" ]; then echo >&2 "Error: kdep version mismatch: Values file version: $valuesFileKdepVersion. kdep version: $VERSION. Make sure the values file has the right syntax (check readme in declarative-deployment-tools).";exit 1;fi
-
+if [ ! "$valuesFileKdepVersion" == "$GrandfatheredInVersion" ]; then
+	if [ ! "$valuesFileKdepVersion" == "$VERSION" ]; then echo >&2 "Error: kdep version mismatch: Values file version: $valuesFileKdepVersion. kdep version: $VERSION. Make sure the values file has the right syntax (check readme in declarative-deployment-tools).";exit 1;fi
+fi
 
 # Set VAULT_ADDR and VAULT_TOKEN
 if [ -z ${VAULT_ADDR+x} ]; then
